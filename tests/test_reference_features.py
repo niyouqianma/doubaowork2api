@@ -128,7 +128,8 @@ async def test_old_generic_reward_pending_migrates_once_to_daily_endpoint(tmp_pa
     assert ledger['previous_endpoint'] == 'item_reward' and ledger['previous_attempt']['submitted_at'] == 1
 
 
-async def test_sdk_error_is_visible_and_does_not_resubmit(tmp_path, monkeypatch):
+async def test_sdk_error_falls_back_to_item_reward_and_does_not_resubmit(tmp_path, monkeypatch):
+    """官方 landing/checkin 恒报 710010702 时，自动降级到 item reward 领取。"""
     accounts = await pool(tmp_path)
     calls = []
 
@@ -144,9 +145,10 @@ async def test_sdk_error_is_visible_and_does_not_resubmit(tmp_path, monkeypatch)
     service = BenefitsService(accounts, object(), tmp_path)
     first = await service.checkin('one')
     second = await BenefitsService(accounts, object(), tmp_path).checkin('one')
-    assert first['status'] == second['status'] == 'manual_required'
-    assert first['code'] == '710010702' and first['query_only'] is True
-    assert calls.count('checkin') == 1
+    assert first['status'] == second['status'] == 'pending'
+    assert first['query_only'] is True
+    assert calls.count('checkin') == 1 and calls.count('claim') == 1
+    assert service.state['accounts']['one']['claim'].get('fallback') == 'item_reward'
 
 
 async def test_definitely_unsent_checkin_can_be_retried(tmp_path, monkeypatch):
@@ -441,3 +443,61 @@ def test_discovered_model_is_callable_through_authenticated_api(tmp_path, monkey
         assert response.json()['choices'][0]['message']['content'] == 'NEW_MODEL_OK'
         assert sent[0][0] == 'one' and sent[0][1]['model_item_key'] == 'new-native-model'
         assert sent[0][1]['reasoning_effort'] == 4
+
+
+async def test_qr_poll_forwards_csrf_cookie_as_header(tmp_path):
+    """官方 passport 要求把 csrf cookie 回填到请求头，否则一律 2035 非法请求。"""
+    import base64
+
+    accounts = AccountPool(tmp_path/'accounts')
+    seen = []
+    png = base64.b64encode(b'\x89PNG\r\n\x1a\nsynthetic').decode()
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith('get_qrcode/'):
+            return httpx.Response(
+                200, json={'data': {'token': 'tok', 'qrcode': 'data:image/png;base64,' + png}},
+                headers={'set-cookie': 'passport_csrf_token=csrf-value; Domain=.doubao.com; Path=/'})
+        if path.endswith('check_qrconnect/'):
+            seen.append(request.headers.get('x-tt-passport-csrf-token'))
+            return httpx.Response(200, json={'data': {'status': 'new', 'error_code': 0}})
+        return httpx.Response(200, text='<html></html>')
+
+    qr = QRLogin(accounts, lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        start = await qr.start('owner-csrf')
+        state = await qr.poll(start['id'], 'owner-csrf')
+        assert state['status'] == 'waiting'
+        assert seen and seen[0] == 'csrf-value'
+    finally:
+        await qr.close()
+
+
+async def test_qr_poll_refreshes_expired_code_without_failing(tmp_path):
+    """二维码过期时自动换新码（官方只有约 60 秒有效期）。"""
+    import base64
+
+    accounts = AccountPool(tmp_path/'accounts')
+    png = base64.b64encode(b'\x89PNG\r\n\x1a\nsynthetic').decode()
+    codes = iter(['tok-old', 'tok-new'])
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith('get_qrcode/'):
+            return httpx.Response(
+                200, json={'data': {'token': next(codes, 'tok-new'),
+                                    'qrcode': 'data:image/png;base64,' + png}})
+        if path.endswith('check_qrconnect/'):
+            return httpx.Response(200, json={'data': {'status': 'expired', 'error_code': 0}})
+        return httpx.Response(200, text='<html></html>')
+
+    qr = QRLogin(accounts, lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        start = await qr.start('owner-refresh')
+        state = await qr.poll(start['id'], 'owner-refresh')
+        assert state['status'] == 'waiting'
+        assert state['image'].startswith('data:image/png;base64,')
+        assert qr._session(start['id'], 'owner-refresh').token == 'tok-new'
+    finally:
+        await qr.close()

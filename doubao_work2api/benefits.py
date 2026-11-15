@@ -105,6 +105,23 @@ class BenefitsService:
         finally:
             self._running.discard(account_id)
 
+    async def _submit_claim(self, account, task, attempt):
+        """提交每日签到。
+
+        官方 ``landing/checkin`` 在部分账号上恒返回 710010702「系统错误」
+        （真实浏览器点击同样如此），此时自动降级到 item reward 领取接口。
+        """
+        try:
+            return await metadata_request(self.transport, account, 'checkin',
+                                          {'scene': task['group'], 'biz_params': {}})
+        except GatewayError as exc:
+            if str(exc.code) != '710010702':
+                raise
+            attempt['fallback'] = 'item_reward'
+            return await metadata_request(self.transport, account, 'claim',
+                                          {'campaign_group_code': task['group'],
+                                           'campaign_item_code': task['code']})
+
     async def _checkin(self, account):
         day = today()
         previous = self.state['accounts'].get(account.id, {}).get('checkin', {})
@@ -140,7 +157,7 @@ class BenefitsService:
             return finish('pending', '今日领取记录对应的活动已变化，请在官方活动页核对；未提交新的领取。', code='checkin_task_changed')
         if same_task and ledger.get('endpoint') == CHECKIN_ENDPOINT and ledger.get('outcome') != 'not_sent':
             if ledger.get('response_code') == '710010702':
-                return finish('manual_required', '官方签到返回 710010702，需要在官方客户端活动页完成签到；完成后可点击回查。',
+                return finish('manual_required', '官方签到接口返回 710010702「系统错误」，已尝试 item reward 备用路由仍未能确认；官方活动页当前同样报错，属服务端问题，建议稍后重试。',
                               code='710010702', query_only=True)
             if ledger.get('outcome') == 'rejected':
                 return finish('error', '官方已拒绝本次签到，请根据错误码处理后在官方活动页核对；本次仅回查。',
@@ -160,13 +177,18 @@ class BenefitsService:
         self._record(account.id, claim=attempt)
         receipt_checked = False
         try:
-            receipt = await metadata_request(self.transport, account, 'checkin', {'scene': task['group'], 'biz_params': {}})
+            receipt = await self._submit_claim(account, task, attempt)
             data = receipt.get('data', {})
             receipt_checked = isinstance(data, dict) and data.get('checked_in') is True
             attempt.update(outcome='receipt_checked' if receipt_checked else 'receipt_unconfirmed', response_code='0')
             if isinstance(data, dict):
                 attempt['receipt_checked'] = receipt_checked
                 attempt['idempotent'] = data.get('idempotent') is True
+                # 官方异步发放时会回 biz_error「领取结果确认中」，仅作诊断记录
+                biz = data.get('biz_error')
+                if isinstance(biz, dict):
+                    attempt['biz_code'] = biz.get('code')
+                    attempt['biz_message'] = str(biz.get('message') or '')[:120]
         except GatewayError as exc:
             code = str(exc.code)
             outcome = 'not_sent' if code == 'metadata_not_sent' else 'rejected' if (code.isdigit() and (len(code) > 3 or code in {'400','401','403','404','412','422','429'})) else 'uncertain'
@@ -190,7 +212,7 @@ class BenefitsService:
                 break
         code = attempt.get('response_code', 'checkin_unconfirmed')
         if code == '710010702':
-            return finish('manual_required', '官方签到返回 710010702，可能要求官方活动页 SDK 参数；请在官方客户端完成签到后回查。',
+            return finish('manual_required', '官方签到接口返回 710010702「系统错误」，item reward 备用路由未能确认签到；官方活动页当前同样报错，与本地参数无关，请稍后重试。',
                           code=code, query_only=True)
         if code in {'403','412','710022004','710022002','712010702'}:
             return finish('verification', '官方要求人工验证，请先在豆包官网处理后回查签到状态。', code=code, query_only=True)

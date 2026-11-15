@@ -27,6 +27,7 @@ const state = {
   automationPollTimer: null,
   qrSession: null,
   qrTimer: null,
+  qrImage: "",
   qrGeneration: 0,
   routing: null,
   routingDirty: false,
@@ -158,6 +159,7 @@ function resetSession(message = "") {
   state.qrGeneration += 1;
   clearTimeout(state.qrTimer);
   state.qrSession = null;
+  state.qrImage = "";
   state.benefits = null;
   state.automationDirty = false;
   $("#qrImage").removeAttribute("src");
@@ -1338,6 +1340,7 @@ async function closeQR(closeDialog = true) {
   clearTimeout(state.qrTimer);
   const previous = state.qrSession;
   state.qrSession = null;
+  state.qrImage = "";
   $('#qrImage').hidden = true;
   $('#qrImage').removeAttribute('src');
   $('#qrStage').setAttribute('aria-busy', 'false');
@@ -1359,9 +1362,10 @@ async function startQR() {
       return;
     }
     state.qrSession = session;
+    state.qrImage = session.image;
     $('#qrImage').src = session.image;
     $('#qrImage').hidden = false;
-    $('#qrStatus').textContent = '请扫码并在手机上确认。二维码约 3 分钟过期。';
+    $('#qrStatus').textContent = '请扫码并在手机上确认。二维码约 60 秒自动刷新。';
     state.qrTimer = setTimeout(() => pollQR(generation, epoch), 2400);
   } catch (error) {
     if (generation === state.qrGeneration && epoch === state.sessionEpoch) $('#qrStatus').textContent = error.message;
@@ -1380,6 +1384,12 @@ async function pollQR(generation, epoch) {
       await refresh({silent: true});
       showToast('账号已保存到本地');
       return;
+    }
+    if (result.image && result.image !== state.qrImage) {
+      // 官方二维码约 60 秒失效，后端会自动换新码，这里同步刷新图片
+      state.qrImage = result.image;
+      $('#qrImage').src = result.image;
+      $('#qrImage').hidden = false;
     }
     $('#qrStatus').textContent = {waiting: '等待扫码…', scanned: '已扫码，请在手机上确认。', expired: '二维码已过期，请刷新。', canceled: '登录已取消，请刷新。'}[result.status] || '等待登录确认…';
     if (['expired', 'canceled'].includes(result.status)) return;

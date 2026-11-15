@@ -1,5 +1,26 @@
 # 版本说明
 
+## v1.0.2 · 2026-11-15
+
+修正每日签到在官方返回 710010702 时的判断与降级。
+
+- 实测确认：真实浏览器打开官方活动页点击「立即签到」，请求体为 `{"scene":"pc_incentive_task_mvp_v3"}`，返回同样是 `710010702「系统错误」`。该错误来自官方服务端，与本地缺少 SDK 参数无关，原提示语误导用户去官方客户端操作。
+- 官方 `landing/checkin` 返回 710010702 时，自动降级到 item reward 领取接口 `/alice/ug/campaign/item/reward/claim/`，并继续走原有的只读回查流程。
+- 记录领取回执里的 `biz_error`（`biz_code` / `biz_message`，如「领取结果确认中」），异步发放时按 pending 处理，不重复提交。
+- 提示文案改为如实说明：官方服务端返回系统错误、活动页当前同样报错、建议稍后重试。
+
+## v1.0.1 · 2026-11-15
+
+修复官方接口变更导致的扫码登录失效，纯 HTTP 实现，无浏览器依赖。
+
+- `check_qrconnect` 补 `x-tt-passport-csrf-token` 请求头（取 cookie 里的 `passport_csrf_token`）。缺失时官方返回 `2035 非法请求` 且无 `status` 字段，旧逻辑把它当成"仍在等待扫码"，表现为手机确认后面板毫无反应。
+- 登录参数与官方网页版对齐：`aid=497858`、`device_platform=web`、`next` 去尾斜杠，补齐 `account_app_language`/`multi_login`/`account_sdk_source`/`os_type`/`terminal_type`，每次请求刷新 `ts`。`aid` 与 `device_platform` 不配套会导致确认后返回 `2156 服务繁忙`。
+- 启动扫码前先访问 `/chat/` 落地 `ttwid`、`odin_tt` 等设备 Cookie。
+- 官方二维码仅约 60 秒有效，过期时自动换码并把会话续期，前端图片自动刷新。
+- `2156/2157` 改为容错继续轮询；其他非 0 错误码显式上报，不再静默等待。
+- 身份查询加 csrf 头并支持 `582478 → 497858` 回退；`cancel()` 幂等。
+- 新增 `qr_diagnose.py` 自检脚本与两条回归测试。
+
 ## v1.0.0 · 2026-11-14
 
 DoubaoWork2API 首个正式版本：提供可自部署的 OpenAI 兼容网关、账号池与 Web 管理面板。
